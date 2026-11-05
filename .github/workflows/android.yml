@@ -1,6 +1,6 @@
 name: EVCfive Android Build
 
-# Run CI for pushes to every branch, not only main/master.
+# Keep this wildcard: pushes to any branch must start Actions.
 on:
   push:
     branches: ["**"]
@@ -17,10 +17,10 @@ concurrency:
 
 jobs:
   build:
-    name: Build Android APK (ARM32)
-    runs-on: ubuntu-latest
+    name: Build ARMv7 FFmpeg and Android APK
+    runs-on: ubuntu-22.04
     steps:
-      - name: Checkout repository
+      - name: Checkout EVCfive
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
@@ -29,28 +29,77 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Android SDK
+      - name: Set up Android SDK and NDK
         uses: android-actions/setup-android@v3
         with:
-          packages: "platform-tools platforms;android-35 build-tools;35.0.0"
+          packages: "platform-tools platforms;android-35 build-tools;35.0.0 ndk;26.3.11579264"
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "8.9"
+      - name: Install FFmpegKit build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool pkg-config curl git doxygen nasm cmake gcc gperf texinfo yasm bison autogen wget autopoint meson ninja-build ragel groff gtk-doc-tools libtasn1-6-dev
+
+      - name: Build FFmpegKit for 32-bit ARM only
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v6.0.4-lts-android https://github.com/ffmpegkit-maintained/ffmpeg.git "$RUNNER_TEMP/ffmpegkit"
+          cd "$RUNNER_TEMP/ffmpegkit"
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          export ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/26.3.11579264"
+          test -x ./android.sh
+          ./android.sh --lts --full \
+            --disable-arm-v7a-neon \
+            --disable-arm64-v8a \
+            --disable-x86 \
+            --disable-x86-64
+          mapfile -t aar_files < <(find prebuilt -type f -name 'ffmpeg-kit-full.aar' | sort)
+          if [ "${#aar_files[@]}" -eq 0 ]; then
+            echo "Could not locate the FFmpegKit full AAR in prebuilt/" >&2
+            find prebuilt -maxdepth 5 -type f | head -200
+            exit 1
+          fi
+          selected="${aar_files[0]}"
+          mkdir -p "$GITHUB_WORKSPACE/app/libs"
+          cp "$selected" "$GITHUB_WORKSPACE/app/libs/ffmpeg-kit-full.aar"
+          unzip -l "$GITHUB_WORKSPACE/app/libs/ffmpeg-kit-full.aar" > "$RUNNER_TEMP/aar-files.txt"
+          if ! grep -q 'jni/armeabi-v7a/' "$RUNNER_TEMP/aar-files.txt"; then
+            echo "The generated AAR does not contain armeabi-v7a native libraries" >&2
+            cat "$RUNNER_TEMP/aar-files.txt"
+            exit 1
+          fi
+          if grep -Eq 'jni/(arm64-v8a|x86|x86_64)/' "$RUNNER_TEMP/aar-files.txt"; then
+            echo "Unexpected non-ARMv7 ABI found in the generated AAR" >&2
+            exit 1
+          fi
+          echo "Using ARMv7 AAR: $selected"
 
       - name: Verify project files
         run: |
           test -f settings.gradle.kts
           test -f app/build.gradle.kts
           test -f app/src/main/AndroidManifest.xml
+          test -s app/libs/ffmpeg-kit-full.aar
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
 
       - name: Build debug APK
         run: gradle --no-daemon --stacktrace assembleDebug
 
+      - name: Verify APK contains ARMv7 native FFmpeg
+        run: |
+          unzip -l app/build/outputs/apk/debug/app-debug.apk | grep 'lib/armeabi-v7a/'
+          if unzip -l app/build/outputs/apk/debug/app-debug.apk | grep -Eq 'lib/(arm64-v8a|x86|x86_64)/'; then
+            echo "Unexpected ABI packaged in APK" >&2
+            exit 1
+          fi
+
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: EVCfive-0.2.191-ARM32-debug-apk
+          name: EVCfive-0.2.192-ARMv7-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error

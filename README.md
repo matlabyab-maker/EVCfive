@@ -2,7 +2,7 @@
 
 Repository: `EVCfive`  
 Application label: `EVCfive`  
-Project version: `0.2.191` (`versionCode 391`)
+Project version: `0.2.192` (`versionCode 392`)
 
 ## Project configuration
 
@@ -32,7 +32,7 @@ on:
 
 This avoids the previous trigger problem where a push to a branch other than `main` or `master` could appear in Git history but would not start an Actions build. Manual workflow execution is also enabled.
 
-The workflow checks out the repository, configures JDK 17 and Android SDK 35, builds the debug APK with Gradle 8.9, and uploads the ARM32 APK as an Actions artifact.
+The workflow checks out the repository, configures JDK 17 and Android SDK 35, builds FFmpegKit from its maintained source for **armeabi-v7a only**, verifies the AAR contains that ABI and no 64-bit/x86 libraries, then builds the debug APK with Gradle 8.9 and uploads it as an Actions artifact. The 32-bit ARM native library is intentionally built in CI because the maintained Maven binaries publish arm64-v8a and x86_64, not armeabi-v7a.
 
 ## First push to the new repository
 
@@ -51,4 +51,12 @@ The workflow checks out the repository, configures JDK 17 and Android SDK 35, bu
 - Removed no functional application source files; no nested duplicate project, build output, or Gradle cache is included.
 - Preserved the application ID and Kotlin package (`com.evc.app`).
 
-A successful Android build and on-device runtime behavior have not been verified in this environment. Confirm the first build in GitHub Actions after pushing.
+## Split stability changes in 0.2.192
+
+- Split now rejects repeated taps while an earlier Split task is active.
+- The status line reports the part currently being generated.
+- Failed/incomplete MediaStore outputs are deleted instead of being left as broken entries.
+- A missing or incompatible native FFmpeg library is reported as an ARMv7 loading error instead of being silently treated as a normal split failure.
+- Original streams are still copied with `-c copy`; no re-encoding is requested. Stream-copy boundaries can still move to nearby keyframes.
+
+A successful GitHub Actions build and on-device runtime behavior have not yet been verified. The first push must complete the native FFmpegKit source build and APK build in Actions before installing the artifact.

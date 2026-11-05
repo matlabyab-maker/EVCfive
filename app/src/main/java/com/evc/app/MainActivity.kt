@@ -74,6 +74,7 @@ import androidx.media3.effect.TextOverlay
 import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.ReturnCode
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import java.io.File
 import java.io.FileInputStream
 import kotlin.math.max
@@ -110,6 +111,8 @@ class MainActivity : Activity() {
     private var selectedTimelineRange: Pair<Long, Long>? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor()
+    // Prevent duplicate native Split sessions, including rapid repeated taps.
+    private val originalSplitInProgress = AtomicBoolean(false)
     // Keep timeline sampling independent so 120 storyboard frames cannot block the timeline strip.
     private val timelineThumbnailWorker = Executors.newSingleThreadExecutor()
     private val selectedFrames = linkedSetOf<Int>()
@@ -3527,71 +3530,108 @@ class MainActivity : Activity() {
         makeDialogDraggable(dialog)
     }
 
-    /** Splits the input into equal-duration files while stream-copying every input stream. */
+    /** Splits the original input into independent files without re-encoding any stream. */
     private fun exportOriginalVideoSplits(partCount: Int, intervalMs: Long? = null) {
         val sourceUri = selectedUri ?: return
         val duration = videoDurationMs
         if (duration <= 0L || partCount < 2 || partCount > 1000 || (intervalMs == null && partCount > 100)) return
+        if (!originalSplitInProgress.compareAndSet(false, true)) {
+            Toast.makeText(this, "عملیات Split در حال اجراست؛ لطفاً صبر کنید", Toast.LENGTH_SHORT).show()
+            return
+        }
         val button = findViewById<Button>(R.id.splitOriginalButton)
         button.isEnabled = false
-        statusText.text = "در حال تقسیم ویدیو به $partCount تکه با کپی مستقیم کدک و همهٔ ترک‌ها…"
-        worker.execute {
-            var inputFile: File? = null
-            var saved = 0
-            val errors = mutableListOf<String>()
-            try {
-                inputFile = copyUriToCache(sourceUri, "evc_original_split")
-                val sourceName = displayNameForUri(sourceUri)
-                val sourceExt = sourceName.substringAfterLast('.', "mp4").lowercase(java.util.Locale.ROOT)
-                    .filter { it.isLetterOrDigit() }.take(8).ifBlank { "mp4" }
-                for (index in 0 until partCount) {
-                    var temp: File? = null
-                    var outUri: Uri? = null
-                    try {
-                        val startMs = if (intervalMs == null) duration * index / partCount else intervalMs * index
-                        val endMs = if (intervalMs == null) duration * (index + 1) / partCount else minOf(duration, intervalMs * (index + 1))
-                        if (endMs <= startMs) throw IllegalStateException("مدت فایل برای این تعداد تکه کافی نیست")
-                        temp = File(cacheDir, "evc_original_part_${index + 1}_${System.currentTimeMillis()}.$sourceExt")
-                        val args = listOf(
-                            "-y", "-ss", String.format(java.util.Locale.US, "%.3f", startMs / 1000.0),
-                            "-i", inputFile.absolutePath,
-                            "-t", String.format(java.util.Locale.US, "%.3f", (endMs - startMs) / 1000.0),
-                            "-map", "0", "-c", "copy", "-avoid_negative_ts", "make_zero",
-                            temp.absolutePath
-                        )
-                        val session = FFmpegKit.executeWithArguments(args.toTypedArray())
-                        if (!ReturnCode.isSuccess(session.returnCode) || !temp.exists() || temp.length() == 0L) {
-                            throw IllegalStateException(session.failStackTrace ?: session.allLogsAsString.takeLast(500).ifBlank { "FFmpeg نتوانست این تکه را ذخیره کند" })
-                        }
-                        val values = ContentValues().apply {
-                            put(MediaStore.Video.Media.DISPLAY_NAME, "EVC_original_part_${(index + 1).toString().padStart(3, '0')}_${System.currentTimeMillis()}.$sourceExt")
-                            put(MediaStore.Video.Media.MIME_TYPE, "video/*")
-                            if (android.os.Build.VERSION.SDK_INT >= 29) {
-                                put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/EVC")
-                                put(MediaStore.Video.Media.IS_PENDING, 1)
+        statusText.text = "آماده‌سازی فایل برای تقسیم…"
+        try {
+            worker.execute {
+                var inputFile: File? = null
+                var saved = 0
+                var fatalError: String? = null
+                val errors = mutableListOf<String>()
+                try {
+                    inputFile = copyUriToCache(sourceUri, "evc_original_split")
+                    if (inputFile.length() <= 0L) throw IllegalStateException("فایل ورودی خالی است")
+                    val sourceName = displayNameForUri(sourceUri)
+                    val sourceExt = sourceName.substringAfterLast('.', "mp4").lowercase(java.util.Locale.ROOT)
+                        .filter { it.isLetterOrDigit() }.take(8).ifBlank { "mp4" }
+                    for (index in 0 until partCount) {
+                        var temp: File? = null
+                        var outUri: Uri? = null
+                        try {
+                            val startMs = if (intervalMs == null) duration * index / partCount else intervalMs * index
+                            val endMs = if (intervalMs == null) duration * (index + 1) / partCount else minOf(duration, intervalMs * (index + 1))
+                            if (endMs <= startMs) throw IllegalStateException("مدت فایل برای این تعداد تکه کافی نیست")
+                            mainHandler.post {
+                                statusText.text = "در حال ساخت تکهٔ ${index + 1} از $partCount…"
                             }
+                            temp = File(cacheDir, "evc_original_part_${index + 1}_${System.currentTimeMillis()}.$sourceExt")
+                            val args = listOf(
+                                "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                                "-ss", String.format(java.util.Locale.US, "%.3f", startMs / 1000.0),
+                                "-i", inputFile.absolutePath,
+                                "-t", String.format(java.util.Locale.US, "%.3f", (endMs - startMs) / 1000.0),
+                                "-map", "0", "-c", "copy", "-avoid_negative_ts", "make_zero",
+                                temp.absolutePath
+                            )
+                            val session = FFmpegKit.executeWithArguments(args.toTypedArray())
+                            if (!ReturnCode.isSuccess(session.returnCode) || !temp.exists() || temp.length() == 0L) {
+                                val detail = session.failStackTrace ?: session.allLogsAsString.takeLast(500)
+                                throw IllegalStateException(detail.ifBlank { "FFmpeg نتوانست این تکه را ذخیره کند" })
+                            }
+                            val values = ContentValues().apply {
+                                put(MediaStore.Video.Media.DISPLAY_NAME, "EVC_original_part_${(index + 1).toString().padStart(3, '0')}_${System.currentTimeMillis()}.$sourceExt")
+                                put(MediaStore.Video.Media.MIME_TYPE, "video/*")
+                                if (android.os.Build.VERSION.SDK_INT >= 29) {
+                                    put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/EVC")
+                                    put(MediaStore.Video.Media.IS_PENDING, 1)
+                                }
+                            }
+                            outUri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+                                ?: throw IllegalStateException("ساخت فایل خروجی ناموفق بود")
+                            contentResolver.openOutputStream(outUri)?.use { output -> temp.inputStream().use { it.copyTo(output) } }
+                                ?: throw IllegalStateException("نوشتن فایل خروجی ناموفق بود")
+                            if (android.os.Build.VERSION.SDK_INT >= 29) {
+                                val published = contentResolver.update(outUri, ContentValues().apply {
+                                    put(MediaStore.Video.Media.IS_PENDING, 0)
+                                }, null, null)
+                                if (published <= 0) throw IllegalStateException("انتشار فایل خروجی در گالری ناموفق بود")
+                            }
+                            saved++
+                        } catch (e: LinkageError) {
+                            outUri?.let { try { contentResolver.delete(it, null, null) } catch (_: Exception) { } }
+                            fatalError = "کتابخانهٔ بومی FFmpeg با معماری ARMv7 سازگار نیست یا بارگذاری نشد: ${e.message ?: e.javaClass.simpleName}"
+                            break
+                        } catch (e: Exception) {
+                            outUri?.let { try { contentResolver.delete(it, null, null) } catch (_: Exception) { } }
+                            errors.add("تکهٔ ${index + 1}: ${e.message ?: e.javaClass.simpleName}")
+                        } finally {
+                            temp?.delete()
                         }
-                        outUri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
-                            ?: throw IllegalStateException("ساخت فایل خروجی ناموفق بود")
-                        contentResolver.openOutputStream(outUri)?.use { output -> temp.inputStream().use { it.copyTo(output) } }
-                            ?: throw IllegalStateException("نوشتن فایل خروجی ناموفق بود")
-                        if (android.os.Build.VERSION.SDK_INT >= 29) {
-                            contentResolver.update(outUri, ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }, null, null)
-                        }
-                        saved++
-                    } catch (e: Exception) {
-                        outUri?.let { try { contentResolver.delete(it, null, null) } catch (_: Exception) { } }
-                        errors.add("تکهٔ ${index + 1}: ${e.message ?: e.javaClass.simpleName}")
-                    } finally { temp?.delete() }
+                    }
+                } catch (e: LinkageError) {
+                    fatalError = "کتابخانهٔ FFmpeg برای ARMv7 بارگذاری نشد: ${e.message ?: e.javaClass.simpleName}"
+                } catch (e: Exception) {
+                    errors.add(e.message ?: e.javaClass.simpleName)
+                } finally {
+                    inputFile?.delete()
                 }
-            } catch (e: Exception) {
-                errors.add(e.message ?: e.javaClass.simpleName)
-            } finally { inputFile?.delete() }
-            mainHandler.post {
-                button.isEnabled = true
-                statusText.text = if (errors.isEmpty()) "$saved تکه در Movies/EVC ذخیره شد؛ همهٔ ترک‌ها با کپی مستقیم و بدون رمزگذاری مجدد نگه داشته شدند. توجه: برش stream-copy ممکن است به مرز کلیدفریم نزدیک شود." else "$saved تکه ذخیره شد؛ ${errors.size} مورد ناموفق بود: ${errors.first()}"
-                Toast.makeText(this, statusText.text, Toast.LENGTH_LONG).show()
+                mainHandler.post {
+                    originalSplitInProgress.set(false)
+                    button.isEnabled = true
+                    val result = when {
+                        fatalError != null -> "$saved تکه ذخیره شد؛ Split متوقف شد. $fatalError"
+                        errors.isEmpty() -> "$saved تکه در Movies/EVC ذخیره شد؛ کدک و ترک‌ها بدون رمزگذاری مجدد کپی شدند. برش stream-copy ممکن است به مرز کلیدفریم نزدیک شود."
+                        else -> "$saved تکه ذخیره شد؛ ${errors.size} مورد ناموفق بود: ${errors.first()}"
+                    }
+                    statusText.text = result
+                    Toast.makeText(this, result, Toast.LENGTH_LONG).show()
+                }
             }
+        } catch (e: Exception) {
+            originalSplitInProgress.set(false)
+            button.isEnabled = true
+            statusText.text = "شروع عملیات Split ناموفق بود: ${e.message ?: e.javaClass.simpleName}"
+            Toast.makeText(this, statusText.text, Toast.LENGTH_LONG).show()
         }
     }
 

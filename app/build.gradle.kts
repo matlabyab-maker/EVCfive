@@ -15,8 +15,8 @@ android {
         ndk {
             abiFilters += listOf("armeabi-v7a")
         }
-        versionCode = 391
-        versionName = "0.2.191"
+        versionCode = 392
+        versionName = "0.2.192"
     }
 
     buildTypes {
@@ -39,6 +39,9 @@ dependencies {
     implementation("androidx.media3:media3-transformer:1.6.1")
     implementation("androidx.media3:media3-effect:1.6.1")
     implementation("androidx.media3:media3-common:1.6.1")
-    // FFmpeg muxing enables Matroska (MKV) output while copying existing streams.
-    implementation("dev.ffmpegkit-maintained:ffmpeg-kit-full:6.0.4")
+    // Built by GitHub Actions specifically for armeabi-v7a. The published Maven
+    // binaries do not include 32-bit ARM, so never replace this with the Maven AAR.
+    implementation(files("libs/ffmpeg-kit-full.aar"))
+    implementation("com.arthenica:smart-exception-java:0.2.1")
+    implementation("androidx.annotation:annotation:1.7.1")
 }
